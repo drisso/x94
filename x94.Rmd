@@ -1,0 +1,915 @@
+---
+title: "Normalization and Clustering of scRNA-seq data of Naka et al."
+author: "Davide Risso"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    fig_height: 7
+    fig_width: 7
+    toc: yes
+    code_folding: hide
+    toc_float: yes
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r options, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, message=FALSE, warning=FALSE)
+# NMF::nmf.options(grid.patch=TRUE) #get rid of blank page in heatmap pdf
+
+library(SummarizedExperiment)
+library(TENxGenomics)
+library(scater)
+library(scone)
+library(clusterExperiment)
+library(ggplot2)
+library(magrittr)
+library(cowplot)
+library(Rtsne)
+library(zinbwave)
+library(uwot)
+library(Seurat)
+library(clustree)
+library(ggridges)
+library(scmap)
+```
+
+# Introduction
+
+In this document we show the code used for the analysis of the single-cell RNA-seq data generated in Naka et al.
+
+The goal is to characterize the transcriptional diversity of Sst cells.
+
+We used the 10x genomics preprocessing pipeline, and we'll start from a matrix of
+UMI counts that need to be normalized and clustered. 
+
+The data folder includes both raw counts and processed data for reproducibility.
+
+To read in the data, we use the [TENxGenomics package](https://github.com/mtmorgan/TENxGenomics) by Martin Morgan. This is not necessary, a simple function that reads in a HDF5 file would be sufficient, but this package provides a nice interface to the `SummarizedExperiment` class.
+
+```{r readin}
+tdt <- matrixSummarizedExperiment("data/tdt/filtered_gene_bc_matrices_h5.h5")
+gfptdt <- matrixSummarizedExperiment("data/gfptdt/filtered_gene_bc_matrices_h5.h5")
+tdt1 <- matrixSummarizedExperiment("data/tdt1/filtered_gene_bc_matrices_h5.h5")
+tdt2 <- matrixSummarizedExperiment("data/tdt2/filtered_gene_bc_matrices_h5.h5")
+
+se <- cbind(tdt1, tdt2, tdt, gfptdt)
+se
+colData(se)$Batch <- as.factor(c(rep("TdT+1", NCOL(tdt1)),
+                                 rep("TdT+2", NCOL(tdt2)),
+                                 rep("TdT+3", NCOL(tdt)),
+                                 rep("TdT+GFP+", NCOL(gfptdt))))
+colData(se)
+```
+
+We processed four batches for a total of `r NCOL(se)` cells.
+
+# Exploratory Data Analysis
+
+Looking at library sizes and detected genes.
+
+```{r eda}
+hist(colSums(assay(se)), breaks=30, 
+     xlab='Number of UMI', main="Number of UMI per sample")
+hist(colSums(assay(se)>0)/nrow(se), breaks=30, 
+     xlab="Proportion of detected genes", main="Proportion of detected genes")
+
+hist(colSums(assay(se)>0), breaks=30, 
+     xlab="Number of detected genes", main="Number of detected genes")
+
+hist(colMeans(assay(se)==0), breaks=30, 
+     xlab="Proportion of zeros", main="Proportion of zeros")
+
+boxplot(colSums(assay(se))~colData(se)$Batch, main="Number of UMI per sample")
+boxplot(colSums(assay(se)>0)/nrow(se)~colData(se)$Batch, main="Proportion of detected genes")
+boxplot(colMeans(assay(se)==0)~colData(se)$Batch, main="Proportion of zeros")
+
+simple <- assay(se)[rowSums(assay(se))>10,]
+simple <- SUM_FN(simple)
+
+library(rARPACK)
+fastpca <- function(expr, scale=FALSE, k=50) {
+  svd_raw <- svds(scale(t(expr), center=TRUE, scale=scale), k=k, nu=k, nv=0)
+  pc_raw <- svd_raw$u %*% diag(svd_raw$d[1:k])
+  return(pc_raw)
+}
+pca <- fastpca(log1p(simple), scale = TRUE)
+```
+
+We use `scater` to explore a set of QC metrics.
+
+```{r scater}
+sce <- as(se, "SingleCellExperiment")
+assayNames(sce) <- "counts"
+sce <- calculateQCMetrics(sce)
+
+ribo_idx <- grep("^Rpl", rowData(se)[,2])
+mito_idx <- grep("^Mt", rowData(se)[,2])
+ribo_pct <- colSums(assay(se)[ribo_idx,])/colSums(assay(se)) * 100
+mito_pct <- colSums(assay(se)[mito_idx,])/colSums(assay(se)) * 100
+tdtomato <- assay(se)["tdTomato",]
+gfp_exp <- assay(se)["GFP",]
+
+Xist <- assay(se)["ENSMUSG00000086503",]
+
+qc <- as.matrix(data.frame(colData(sce)[,c(7, 9:13)], mito_pct = mito_pct, ribo_pct = ribo_pct,
+                           Xist = Xist, tdtomato = tdtomato, gfp = gfp_exp))
+qcpca <- prcomp(qc, scale. = TRUE)
+plot(qcpca$x, col=bigPalette[1], pch=19, main="QC PCA")
+
+cors <- lapply(1:3, function(i) abs(cor(pca[,i], qc, method="spearman")))
+cors <- unlist(cors)
+bars <- data.frame(AbsoluteCorrelation=cors,
+                   QC=factor(rep(colnames(qc), 3), levels=colnames(qc)),
+                   Dimension=as.factor(rep(paste0("PC", 1:3), each=ncol(qc))))
+
+bars %>%
+  ggplot(aes(Dimension, AbsoluteCorrelation, group=QC, fill=QC)) +
+  geom_bar(stat="identity", position='dodge') +
+  scale_fill_manual(values=bigPalette) + ylim(0, 1) + 
+  ggtitle("Correlation between QC and expression PCA")
+
+fig_data <- data.frame(PC1 = pca[,1], PC2 = pca[,2], qc, colData(se),
+                   QPC1=qcpca$x[,1], QPC2=qcpca$x[,2])
+
+fig_pca <- ggplot(fig_data, aes(x = PC1, y = PC2, color = log10_total_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+fig_pca
+
+fig_qpca <- ggplot(fig_data, aes(x = QPC1, y = QPC2, color = log10_total_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+fig_qpca
+
+fig_pca <- ggplot(fig_data, aes(x = PC1, y = PC2, color = ribo_pct)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+fig_pca
+
+fig_qpca <- ggplot(fig_data, aes(x = QPC1, y = QPC2, color = ribo_pct)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+fig_qpca
+
+fig_pca <- ggplot(fig_data, aes(x = PC1, y = PC2, color = tdtomato)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+fig_pca
+
+fig_qpca <- ggplot(fig_data, aes(x = QPC1, y = QPC2, color = tdtomato)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+fig_qpca
+
+fig_pca <- ggplot(fig_data, aes(x = PC1, y = PC2, color = Batch)) +
+  geom_point() + scale_color_brewer(palette = "Set1")
+fig_pca
+
+heatmap(cor(qc, method = "spearman"))
+```
+
+# Filtering
+
+We use `scone` to filter out lowly-expressed genes and low-quality cells.
+
+```{r filtering}
+colData(se) <- colData(sce)
+
+# select expressed genes only
+se <- se[rowSums(assay(se))>0,]
+
+# select common genes
+num_reads <- quantile(assay(se)[assay(se) > 0])[4]
+num_cells = 0.25*ncol(se)
+is_common = rowSums(assay(se) >= num_reads ) >= num_cells
+table(is_common)
+
+# select housekeeping genes
+data("housekeeping")
+hk <- stringr::str_to_title(housekeeping[,1])
+hk_idx <- which(rowData(se)$Symbol %in% hk)
+
+mfilt <- metric_sample_filter(assay(se),
+                             nreads = colData(se)$total_counts,
+                             gene_filter = is_common,
+                             pos_controls = hk_idx,
+                             hard_nreads = 2000,
+                             zcut = 3, mixture = FALSE,
+                             plot = TRUE)
+
+plot(pca, pch=19, col=bigPalette[as.numeric(mfilt$filtered_breadth)+1],
+     main = "PCA Filtered on transcriptome 'breadth'")
+plot(pca, pch=19, col=bigPalette[as.numeric(mfilt$filtered_fnr)+1],
+     main = "PCA Filtered on FNR AUC")
+
+plot(qcpca$x, pch=19, col=bigPalette[as.numeric(mfilt$filtered_breadth)+1],
+     main = "QPCA Filtered on transcriptome 'breadth'")
+plot(qcpca$x, pch=19, col=bigPalette[as.numeric(mfilt$filtered_fnr)+1],
+     main = "QPCA Filtered on FNR AUC")
+
+table(mfilt$filtered_nreads, mfilt$filtered_fnr)
+filter_cell <- !apply(simplify2array(mfilt[!is.na(mfilt)]),1,any)
+
+plot(qcpca$x, pch=19, col=bigPalette[as.numeric(filter_cell)+1],
+     main = "PCA Filtered on FNR AUC")
+
+table(filter_cell, se$Batch)
+
+# Final Gene Filtering: Highly expressed in at least 5 cells
+num_reads <- quantile(assay(se)[assay(se) > 0])[4]
+num_cells = 5
+is_quality = rowSums(assay(se) >= num_reads ) >= num_cells
+
+filtered <- se[is_quality, filter_cell]
+
+qc <- qc[colnames(filtered),]
+```
+
+After filtering, we retain `r NROW(filtered)` genes and `r NCOL(filtered)` cells.
+
+```{r save_filtered}
+save(filtered, file="data/combined_filtered_all_batches.rda")
+save(qc, file="data/combined_filtered_qc.rda")
+```
+
+# Check for batch effects
+
+```{r batch}
+# check for batch effects
+pca <- fastpca(log1p(SUM_FN(assay(filtered))), scale = TRUE, k=50)
+tsne_data <- Rtsne(pca, pca=FALSE, max_iter = 5000)
+qcpca <- prcomp(qc, scale. = TRUE)
+
+plot(pca, pch=19, col=bigPalette[colData(filtered)$Batch],
+     main = "PCA Color-coded by batch")
+plot(qcpca$x, pch=19, col=bigPalette[colData(filtered)$Batch],
+     main = "QPCA Color-coded by batch")
+
+boxplot(pca[,1] ~ colData(filtered)$Batch)
+boxplot(pca[,2] ~ colData(filtered)$Batch)
+
+plot(tsne_data$Y, pch=19, col=bigPalette[colData(filtered)$Batch])
+legend("bottomleft", levels(filtered$Batch), fill=bigPalette)
+
+idx <- colnames(filtered)
+fig_data <- data.frame(PC1=pca[,1], PC2=pca[,2], colData(filtered),
+                       TSNE1=tsne_data$Y[,1], TSNE2=tsne_data$Y[,2])
+
+ggplot(fig_data, aes(x = PC1, y = PC2, color = log10_total_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+```
+
+# Normalization
+
+## SCONE
+
+We use the `scone` package to perform and compare several normalization methods. 
+
+The normalized data will be use only for exploratory purposes, as the dimensionality reduction (see next step) carries its own normalization.
+
+Note: since this step is computationally heavy, we have saved the results in the `data/` folder and by default running this document will load the pre-computed results. To re-run the scone function, change the following line to `run_scone <- TRUE`.
+
+```{r scone}
+run_scone <- FALSE
+
+## select positive controls (from Allen paper)
+gabaergic <- c("Crispld2", "Cxcl14", "Tpm2", "Itih5", "Cox6a2",
+               "Cxcl14", "Car4", "Tac2", "Reln", "Npy2r", "Tnfaip8l3", "Cadps2", "2310042E22Rik", "Egln3", "Tpd52l1", "Megf10", "Aebp1", "Slc18a3", "Pvrl4", "Nrp1", "Sema5b", "Pcdh15", "Phlda1", "Bcar3", "Mab21l1", "Pbx3", "Nrp1", "Crh", "Lamp5", "Tnfaip8l3", "Atp6ap1l", "Gabrd", "Npy", "Pde11a", "Has2", "Krt12", "2310042E22Rik", "Ndst4", "Tnnt1", "Reln", "Mpped1", "Pde1a", "Pcdh18", "4921511H03Rik", "Rgs12", "Cd34", "Egln3", "Thsd7b", "Reln", "Krt12", "2310042E22Rik", "Ndst4", "Lhx6", "Cdca7", "Myo5b", "Pdlim3", "Efcab6", "Tnnt1", "Cryab", "Nfib", "Kit", "Lamp5", "Cd34", "Sln", "Npy", "Col14a1", "Rasl11a", "Frmd7", "Edn3", "Tnfaip8l3", "Frem1", "Scml4", "St6galnac5", "Pbx3", "Fam107a", "Krt73", "Cyb5r2", "Kcns3", "Rasl11a", "Timp3", "Adamts18", "Ano3", "Rasl11a", "Tnni3k", "Bdnf", "Gabrg1", "Spp1", "Nr4a2", "Hspb3", "Nts", "Myh8", "Chrna2", "Glra3", "Kit", "Ppapdc1a", "Nr2f2", "Gfra2", "Myh1", "Myh4", "Myh13", "Grm3", "Il1rapl2", "Tnni3k", "Cartpt", "Chrna2", "Tmem90a", "Nr2f2", "Myh4", "Myh13", "Myh1", "C1qtnf7", "4930503E14Rik", "Gm5622", "Gm8267", "Efemp1", "Grm3", "Cartpt", "Crh", "Pla2g4a", "Sgpp2", "Trpv6", "Klhl14", "Chrnb3", "Grm3", "Ano3", "Fam5c", "Htr2a", "Irs4", "Tacr1", "Nos1", "Bace2", "Ccdc109b", "Dnase1l3", "Gpr126", "Gpr151", "Gstm6", "Hcrtr1", "Htr7", "Krt18", "Insl6", "Ndst4", "Sit1", "9430021M05Rik", "Gabrg1", "Cdca7", "Ndst4", "Gpr88", "Man1a", "Th", "Calca", "Nell1", "Fxyd6", "Tac1", "Tacr3", "Ednrb", "Thsd7a", "Fosb", "Il1rapl2", "Tll1", "Col25a1", "Calb1", "Kit", "Etv1", "Bdnf", "Aloxe3", "Nt5e", "Cntnap5b", "Thsd7a", "Snca", "Cacna2d3", "Kit", "Pcdh8", "Olfm3", "Pdlim3", "Nfib", "Krt12", "Cdca7", "Thsd7a", "Gm1051", "Caln1", "Calb1", "Il1rapl2", "Col25a1", "Tac1", "Tpbg", "Gpx3", "Akr1c18", "Ntf3", "Lrrc61", "Tac1", "Tusc5", "Fign", "Il1rapl2", "Acsbg1", "Tac1", "Il1rapl2")
+
+glutamatergic <- c("Rspo1", "Inhba", "Sparcl1", "Pde1a", "Lmo3", "Rorb", "Whrn", "Rspo1", "Endou", "Tmem215", "Rorb", "Whrn", "Pde1a", "Endou", "Plb1", "Aldh1l1", "Etv1", "Deptor", "Rorb", "Whrn", "Cpne7", "Scnn1a", "Endou", "Rspo1", "Whrn", "Stard8", "Inhba", "Wfs1", "Otof", "Enpp2", "Palmd", "Rgs8", "Dgkb", "Adamts2", "Fst", "Matn2", "Cdh13", "Dgkb", "Otof", "Pacsin2", "Myl4", "Deptor", "Tmem91", "Whrn", "Il1rapl2", "Hsd11b1", "Nnat", "Syt17", "Myl4", "D430036J16Rik", "Deptor", "Arhgap25", "Cpne2", "Il1rapl2", "Foxo1", "Deptor", "Myl4", "Aldoc", "Arhgap25", "Il1rapl2", "Hhatl", "Itga7", "Myl4", "Arhgap25", "Man1a", "Penk", "Anxa11", "Cd7", "Cited1", "Lipg", "Nnat", "Ptchd2", "Sorcs3", "Inhba", "C1ql3", "Pter", "Acvr1c", "Fst", "Prss22", "Traip", "Ptprk", "Il1rapl2", "Ctgf", "Tnmd", "Nxph4", "Col24a1", "Trh", "Fam46a", "Ngf", "Moxd1", "Ndrg1", "Tmem40", "Cplx3", "Cidea", "Inpp4b", "Lman1l", "Igsf3", "Ctgf", "Nxph4", "Cidea", "Ly6g6e", "Sla", "Cplx3", "Clic5", "Lman1l", "Gpr126", "Arhgap25", "Foxp2", "Ly6d", "Rprm", "Ifitm2", "Ctxn3", "Crym", "Foxp2", "Gabra5", "Rprm", "Plekhb1", "Slc6a11", "Crym", "Chrnb3", "Scml2", "Ngb", "Klk8", "Plac9", "Ddit4l", "Fam84b", "Qrfpr", "Samd3", "Stac", "Ddit4l", "2310042E22Rik", "Kcns3", "Mc4r", "Coro6", "Sema3c", "Kctd8", "Crym", "Fam84b", "Ptgfr", "Depdc7", "Qrfpr", "Col6a1", "Syt17", "2310042E22Rik", "Crym", "Man1a", "Fam84b", "Ctxn3")
+
+nonneruonal <- c("F3", "Rorb", "Acsbg1", "Slc39a12", "Ntsr2", "Plcd4", "Gja1", "Gjb6", "Cbs", "Chrdl1", "Prodh", "Mlc1", "Acsl6", "Slc4a4", "Gabrg1", "Cxcl14", "Slco1c1", "Vcam1", "Ednrb", "Scrg1", "Bcan", "Cspg4", "Pcdh15", "Gria3", "Cacng4", "E130309F12Rik", "Vcan", "Ednrb", "Scrg1", "Bcan", "Gpr17", "Brca1", "Rnf122", "Mbp", "Zcchc12", "Enpp6", "Kif19a", "Enpp6", "Dct", "Tmeff2", "Gpr17", "1700040N02Rik", "1810041L15Rik", "St18", "Vcan", "Bcan", "9530059O14Rik", "Cldn11", "1700047M11Rik", "Mbp", "Mog", "Aspa", "Mobp", "Gpr37", "Ppp1r14a", "Gjb1", "Tmeff2", "St18", "Cldn11", "1700047M11Rik", "Kctd13", "Cntn2", "Eml1", " A530088E08Rik", "Cx3cr1", "C1qb", "Cd53", "Csf1r", "Itgam", "Abi3", "C1qa", "Aif1", "Trem2", "P2ry13", "Tmem119", "C1qc", "Cd14", "Fcgr3", "Gpr34", "Inpp5d", "Nckap1l", "Mpeg1", "Siglech", "Susd3", "Hk2", "Ly86", "Sparc", "Fli1", "Tbc1d4", "AI467606", "Exosc7", "Eltd1", "Fas", "Hmgcs2", "Nostrin", "Paqr5", "Slc16a4", "Id1", "Ptprb", "Cd93", "Sparc", "Fli1", "Ly6a", "Ly6c1", "Ly6c2", "Flt1", "Pglyrp1", "Slco1a4", "Ifitm3", "Abcb1a", "Ahnak", "Bgn", "Nupr1", "Casq2", "Mylk", "Gprc5c", "Slc38a11", "Slc6a20a", "Pcolce", "Vtn", "Cnn2", "Nid1", "Gpr30", "Higd1b", "Ifitm1", "P2ry14", "Serping1", "Sparc", "Fli1", "Cald1", " Abcb1a", "Flt1", "Ly6a", "Ly6c1", "Ly6c2", "Pglyrp1", "Slco1a4", "Ahnak")
+
+poscon <- intersect(c(gabaergic, glutamatergic, nonneruonal), rowData(filtered)$Symbol)
+rowData(filtered)$poscon <- (rowData(filtered)$Symbol %in% poscon)
+
+## select negative controls (housekeeping)
+hk <- intersect(hk, rowData(filtered)$Symbol)
+set.seed(42)
+negconeval <- sample(hk, length(poscon))
+negconruv <- setdiff(hk, negconeval)
+rowData(filtered)$negcon_eval <- (rowData(filtered)$Symbol %in% negconeval)
+rowData(filtered)$negcon_ruv <- (rowData(filtered)$Symbol %in% negconruv)
+
+names <- colnames(qc)[1:8]
+if(run_scone) {
+  library(BiocParallel)
+  library(doParallel)
+  registerDoParallel(7)
+  register(DoparParam())
+  
+  scone_obj <- SconeExperiment(filtered,
+                               which_qc = which(colnames(colData(filtered)) %in% names),
+                               which_negconruv = which(colnames(rowData(filtered)) == "negcon_ruv"),
+                               which_negconeval = which(colnames(rowData(filtered)) == "negcon_eval"),
+                               which_poscon = which(colnames(rowData(filtered)) == "poscon"),
+                               which_batch = which(colnames(colData(filtered)) == "Batch"))
+  
+  scone_obj <- scone(scone_obj,
+                     scaling = list(none=identity, sum = SUM_FN, tmm = TMM_FN,
+                                    fq = FQT_FN, deseq = DESEQ_FN),
+                     zero = "postadjust",
+                     adjust_batch = "no")
+  save(scone_obj, file="data/combined_scone_res_all_batches.rda")
+} else {
+  load("data/combined_scone_res_all_batches.rda")
+}
+
+norm <- get_normalized(scone_obj, "none,fq,ruv_k=5,no_bio,no_batch")
+lognorm <- log1p(norm)
+```
+
+## ZINB-WaVE
+
+We use the `zinbwave` Bioconductor package for the dimensionality reduction of the data.
+
+In particular, we use `K=10` dimensions to describe the data and `ribo_pct`, `total features`, and `batch` as covariates.
+
+Note: since this step is computationally heavy, we have saved the results in the `data/` folder and by default running this document will load the pre-computed results. To re-run the zinbwave function, change the following line to `run_zinbwave <- TRUE`.
+
+
+```{r zinbwave}
+run_zinbwave <- FALSE
+
+vars <- rowVars(lognorm)
+names(vars) <- rownames(filtered)
+vars <- sort(vars, decreasing = TRUE)
+
+colData(filtered)$ribo_pct <- qc[,"ribo_pct"]
+
+if(run_zinbwave) {
+library(BiocParallel)
+library(doParallel)
+registerDoParallel(7)
+register(DoparParam())
+
+zinb <- zinbFit(filtered[names(vars)[1:1000],], 
+                X = "~ Batch + ribo_pct + log10_total_features", 
+                K=10, epsilon=1000)
+save(zinb, file="data/combined_zinbwave_all_batches.rda")
+} else {
+  load("data/combined_zinbwave_all_batches.rda")
+}
+
+W <- getW(zinb)
+rownames(W) <- colnames(filtered)
+colnames(W) <- paste0("W", 1:10)
+tsne_zinb <- Rtsne(W, pca = FALSE, max_iter=5000)
+
+umap_zinb <- umap(W, n_neighbors = 15)
+```
+
+```{r zinbwave_plot, dependson="zinbwave"}
+plot(W[,1:2], pch=19, col=bigPalette[colData(filtered)$Batch])
+
+plot(tsne_zinb$Y, pch=19, col=bigPalette[colData(filtered)$Batch])
+legend("topright", levels(colData(filtered)$Batch), fill=bigPalette)
+
+idx <- colnames(filtered)
+fig_data <- data.frame(W1 = W[,1], W2 = W[,2], colData(filtered),
+                       TSNE1=tsne_zinb$Y[,1], TSNE2=tsne_zinb$Y[,2],
+                       UMAP1=umap_zinb[,1],
+                       UMAP2=umap_zinb[,2]
+                      )
+
+ggplot(fig_data, aes(x = W1, y = W2, color = log10_total_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = W1, y = W2, color = log10_total_features_by_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = W1, y = W2, color = ribo_pct)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = TSNE1, y = TSNE2, color = log10_total_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = TSNE1, y = TSNE2, color = log10_total_features_by_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = TSNE1, y = TSNE2, color = ribo_pct)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = UMAP1, y = UMAP2, color = log10_total_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = UMAP1, y = UMAP2, color = log10_total_features_by_counts)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+ggplot(fig_data, aes(x = UMAP1, y = UMAP2, color = ribo_pct)) +
+  geom_point() + scale_color_continuous(low = "blue", high = "yellow")
+
+cors <- lapply(1:10, function(i) abs(cor(W[,i], qc, method="spearman")))
+cors <- unlist(cors)
+bars <- data.frame(AbsoluteCorrelation=cors,
+                   QC=factor(rep(colnames(qc), 10), levels=colnames(qc)),
+                   Dimension=as.factor(rep(paste0("W", 1:10), each=ncol(qc))))
+
+bars %>%
+  ggplot(aes(Dimension, AbsoluteCorrelation, group=QC, fill=QC)) +
+  geom_bar(stat="identity", position='dodge') +
+  scale_fill_manual(values=bigPalette) + ylim(0, 1) + 
+  ggtitle("Correlation between QC and W")
+```
+
+# Clustering using ZINB-WaVE projection
+
+## Seurat
+
+```{r seurat, results="hide"}
+dat <- assay(filtered)
+rownames(dat) <- rowData(filtered)$Symbol
+rownames(dat)[rownames(dat) == "Smim20"] <- paste0("Smim20", 1:2)
+colnames(dat) <- paste0("Sample", seq_len(NCOL(dat)))
+
+seu <- CreateSeuratObject(raw.data = dat)
+
+seu <- SetDimReduction(object = seu, reduction.type = "zinbwave", slot = "cell.embeddings", 
+    new.data = W)
+seu <- SetDimReduction(object = seu, reduction.type = "zinbwave", slot = "key", 
+    new.data = "zinbwave")
+
+seu <- FindClusters(object = seu, reduction.type = "zinbwave", dims.use = 1:10, 
+    resolution = seq(0, 2, 0.2), print.output = 0, save.SNN = TRUE)
+
+clustree(seu)
+```
+
+```{r clX, dependson="seurat"}
+colidx <- grep("res.", colnames(seu@meta.data), fixed = TRUE)
+clustMat <- as.matrix(cbind(seu@ident,
+                  seu@meta.data[,colidx[-c(1, length(colidx))]]))
+colnames(clustMat) <- c("Seurat", paste0("Seurat", seq(0.2, 1.8, by=.2)))
+
+cl2 <- ClusterExperiment(norm, clustMat, transformation = log1p)
+
+clusterLegend(cl2)[[1]][,"name"] <- paste0("S", clusterLegend(cl2)[[1]][,"name"]) 
+clusterLegend(cl2)[[1]][,"color"] <- massivePalette[-(1:11)][1:NROW(clusterLegend(cl2)[[1]])]
+clusterLegend(cl2)[[1]][,"color"] <- clusterLegend(cl2)[[1]][,"color"][c(7, 2, 12, 6, 8, 13, 15, 1, 5, 4, 3, 10, 11, 14, 9)]
+colData(cl2) <- colData(filtered)
+
+gfp <- rep("no", NCOL(filtered))
+gfp[filtered$Batch == "TdT+GFP+"] <- "GFP"
+gfp <- as.factor(gfp)
+colData(cl2)$gfp <- gfp
+
+plotClusters(cl2, whichClusters = 2:1, existingColors = "firstOnly",
+             colData = c("Batch", "gfp"))
+
+plotClusters(cl2, existingColors = "firstOnly")
+
+plotClusters(cl2, whichClusters = c(1, 2), colData = c("gfp"), existingColors = "firstOnly")
+```
+
+## Visualization
+
+```{r visualize_seurat, dependson="clX"}
+cols1 <- clusterLegend(cl2)[[1]][, "color"]
+names(cols1) <- clusterLegend(cl2)[[1]][, "name"]
+
+pal2 <- c("#33A02C", "magenta2")
+
+colMerged1 <- cols1[primaryClusterNamed(cl2)]
+
+lab_s <- factor(primaryClusterNamed(cl2),
+                       levels=clusterLegend(cl2)[[1]][, "name"])
+
+plot(W, pch=19, col=colMerged1, main="W, Seurat")
+legend("bottomright", levels(lab_s), fill=cols1[levels(lab_s)])
+
+plot(tsne_zinb$Y, pch=19, col=colMerged1, main="t-SNE, All genes, Seurat",
+     xlab="Dim 1", ylab="Dim 2")
+
+plot(tsne_zinb$Y, pch=19, col=pal2[cl2$gfp])
+legend("topleft", levels(cl2$gfp), fill=pal2)
+
+plot(umap_zinb, pch=19, col=colMerged1, main="t-SNE, All genes, Seurat",
+     xlab="Dim 1", ylab="Dim 2")
+
+plot(umap_zinb, pch=19, col=pal2[cl2$gfp])
+legend("bottomright", levels(cl2$gfp), fill=pal2)
+
+tab <- table(lab_s, gfp)
+print(tab)
+print(round(tab/rowSums(tab), 2))
+```
+
+# Marker genes
+
+```{r heatmap_zinb, dependson=c("clX", "visualize_seurat")}
+reducedDim(cl2, "zinbwave") <- W
+rownames(cl2) <- rowData(filtered)$Symbol
+
+cl2 <- makeDendrogram(cl2, reduceMethod = "zinbwave", nDims = 10)
+plotDendrogram(cl2, plotType = "name", leafType = "clusters")
+
+merged <- mergeClusters(cl2, mergeMethod = "adjP", cutoff = 0.05, plotInfo="mergeMethod", DEMethod = "limma")
+
+plotClustersTable(merged, whichClusters = 1:2)
+
+genes <- getBestFeatures(cl2, contrastType = "Dendro", DEMethod="limma-voom", number = 100)
+head(genes)
+
+plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
+            sampleData = c("gfp", "Batch"),
+            clusterFeaturesData=unique(genes[,"IndexInOriginal"]), breaks=.99)
+
+genes_1vall <- getBestFeatures(cl2, contrastType = "OneAgainstAll",
+                               DEMethod="limma",
+                               number=100)
+
+plotHeatmap(cl2, clusterSamplesData = "dendrogramValue", breaks=.95,
+            sampleData = c("gfp", "Batch"),
+            clusterFeaturesData=unique(genes_1vall[,"IndexInOriginal"]))
+
+genes_5 <- getBestFeatures(cl2, contrastType = "OneAgainstAll", DEMethod="limma",
+                               number=5)
+
+plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
+            sampleData = c("gfp", "Batch"),
+            clusterFeaturesData=unique(genes_5[,"IndexInOriginal"]), breaks=.99)
+
+genes_5 <- getBestFeatures(cl2, contrastType = "Dendro", DEMethod="limma",
+                               number=5)
+
+plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
+            sampleData = c("gfp", "Batch"),
+            clusterFeaturesData=unique(genes_5[,"IndexInOriginal"]), breaks=.99)
+
+top <- getBestFeatures(cl2, contrastType="Dendro", DEMethod="limma", number=Inf, p.value=0.05)
+
+xx <- factor(primaryClusterNamed(cl2), 
+             levels=paste0("S", 0:(nClusters(cl2)[1]-1)))
+means <- t(apply(log1p(assay(cl2))[top$Feature,], 1, tapply, xx, mean))
+
+retval <- cbind(top, means[top$Feature,])[, -c(3, 5, 7, 8, 11)]
+write.table(retval, "DE_genes_dendro_merged_zinb_all_batches.txt", quote=FALSE, sep="\t")
+
+top <- getBestFeatures(cl2, contrastType = "OneAgainstAll", DEMethod="limma", number=Inf, p.value=0.05)
+
+means <- t(apply(log1p(assay(cl2))[top$Feature,], 1, tapply, xx, mean))
+retval <- cbind(top, means[top$Feature,])[, -c(3, 5, 7, 8, 11)]
+
+map <- data.frame(ids = paste0("Cl", stringr::str_pad(1:nClusters(cl2)[1], width=2, pad=0)),
+                  Contrast = clusterLegend(cl2)[[1]][,"name"], stringsAsFactors = FALSE)
+retval <- dplyr::inner_join(retval, map, by = c("ContrastName" = "ids"))[,-(1:2)]
+
+write.table(retval, "DE_genes_1vall_merged_zinb_all_batches.txt", quote=FALSE, sep="\t")
+```
+
+```{r markers_zinb, dependson="heatmap_zinb"}
+markers <- list(m1=c("Ddit4l", "Whrn", "Plb1", "Aldh1l1", "Endou", "Thsd7a",
+                     "Spock3", "Car4"),
+                m3=c("Nnat", "Syt17", "Cdh13", "Cpne7", "Cnr1", "Plxna4"),
+                m7=c("Crym", "Tcerg1l", "Fam84b", "Serpine2", "Fam84a",
+                     "Bcl11b", "Bcl6", "Igfbp4", "Fezf2", "Npr3"),
+                m8=c("Hsd11b1", "Myl4", "Deptor", "Cplx2", "Tbr1", "Dkk3")
+)
+markers <- unlist(markers)
+
+plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
+            sampleData = c("gfp", "Batch"),
+            clusterFeaturesData=which(rownames(cl2) %in% markers), breaks=.99)
+
+plotContrastHeatmap(cl2, genes_5)
+
+genes_5b <- getBestFeatures(cl2, contrastType = "OneAgainstAll",
+                            DEMethod="limma-voom", number=5)
+
+plotContrastHeatmap(cl2, genes_5b)
+```
+
+```{r save, dependson="clX"}
+table(lab_s, cl2$Batch)
+save(cl2, file="data/clusterexperiment_all_batches.rda")
+```
+
+```{r allen, dependson="heatmap_zinb"}
+fig2 <- c("Sst", "Chodl", "Nos1", "Etv1", "Il1rapl2", "Myh8", "Chrna2",
+          "Tac2", "Crhr2", "Calb2", "Hpse", "C1ql3", "Crh", "Nts", "Pvalb",
+          "Gabrg1", "Th", "Prdm8", "Calb1", "Reln", "Gpr149", "Cpne5",
+          "Vipr2", "Nkx2.1")
+
+plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
+            sampleData = c("gfp"),
+            clusterFeaturesData=which(rownames(cl2) %in% fig2), breaks=.99)
+
+rownames(lognorm) <- rownames(cl2)
+
+df <- data.frame(t(lognorm[intersect(c(fig2, "GFP", "tdTomato"), rownames(lognorm)),]),
+                 Cluster = lab_s, Batch = cl2$Batch)
+
+ggplot(df, aes(x = Calb1, y = Batch, fill = Batch)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = bigPalette) +
+  ggtitle("Calb1 expression")
+
+ggplot(df, aes(x = Calb2, y = Batch, fill = Batch)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = bigPalette) +
+  ggtitle("Calb2 expression")
+
+ggplot(df, aes(x = Sst, y = Batch, fill = Batch)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = bigPalette) +
+  ggtitle("Sst expression")
+
+ggplot(df, aes(x = Calb1, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("Calb1 expression")
+
+ggplot(df, aes(x = Calb2, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("Calb2 expression")
+
+ggplot(df, aes(x = Sst, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("Sst expression")
+
+ggplot(df, aes(x = Pvalb, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("Pvalb expression")
+
+ggplot(df, aes(x = Reln, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("Reln expression")
+
+ggplot(df, aes(x = Myh8, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("Myh8 expression")
+
+ggplot(df, aes(x = C1ql3, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("C1ql3 expression")
+
+ggplot(df, aes(x = GFP, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("GFP expression")
+
+ggplot(df, aes(x = tdTomato, y = Cluster, fill = Cluster)) +
+  geom_density_ridges() + 
+  scale_fill_manual(values = cols1) +
+  ggtitle("tdTomato expression")
+```
+
+## Subsample analysis (cluster stability)
+
+```{r sub_seurat}
+## adapted from Allen (https://github.com/AllenInstitute/scrattch.hicat/blob/master/R/cluster.R)
+jaccard <- function(m) {
+  library(Matrix)
+  
+  ## common values:
+  A <-  m %*% t(m)
+  
+  ## indexes for non-zero common values
+  im <- Matrix::which(A > 0, arr.ind=TRUE)
+  
+  ## counts for each row
+  b <- Matrix::rowSums(m)  
+  
+  ## only non-zero values of common
+  Aim <- A[im]
+  
+  ## Jacard formula: #common / (#i + #j - #common)
+  J <- sparseMatrix(
+    i = im[,1],
+    j = im[,2],
+    x = Aim / (b[im[,1]] + b[im[,2]] - Aim),
+    dims = dim(A)
+    )  
+  return(J)
+}
+
+pass_louvain <- function(mod.sc, adj.mat)
+{
+  library(Matrix)
+  p <- mean(Matrix::colSums(adj.mat > 0) - 1) / nrow(adj.mat)
+  n <- ncol(adj.mat)
+  rand.mod1 <- 0.97 * sqrt((1 - p) / (p * n))
+  rand.mod2 <- (1 - 2 / sqrt(n)) * (2 / (p * n)) ^ (2 / 3)
+  rand.mod.max <- max(rand.mod1, rand.mod2, na.rm = TRUE)
+  #cat("Modularity:",mod.sc, "threshold:",rand.mod.max, "\n")
+  return(mod.sc > rand.mod.max)
+}
+
+jaccard_louvain.FNN <- function(x, 
+                                k = 10, 
+                                knn.matrix = NULL, ...)
+{
+  library(igraph)
+  library(matrixStats)
+  library(FNN)  
+  
+  if(is.null(knn.matrix)){
+    knn.result <- FNN::get.knn(t(x), k)
+    knn.matrix <- knn.result[[1]]
+  }
+  
+  p <- as.vector(t(knn.matrix))
+  
+  edge <- cbind(rep(1:nrow(knn.matrix), rep(k, nrow(knn.matrix))), p)
+  
+  edge.unique <- cbind(rowMins(edge), rowMaxs(edge))
+  edge.unique <- unique(edge.unique)
+  
+  knn.gr <- igraph::graph(t(edge))
+  knn.matrix <- igraph::get.adjacency(knn.gr)
+  
+  jaccard.adj  <- jaccard(knn.matrix)
+  jaccard.gr <- igraph::graph.adjacency(jaccard.adj, 
+                                        mode = "undirected", 
+                                        weighted = TRUE)
+  
+  louvain.result <- igraph::cluster_louvain(jaccard.gr)
+  
+  mod.sc <- igraph::modularity(louvain.result)
+  
+  if(pass_louvain(mod.sc, jaccard.adj)) {
+    
+    cl <- setNames(louvain.result$membership, row.names(x))
+    
+    return(cl)
+    
+  } else{
+    
+    return(NULL)
+    
+  }
+}
+
+internalFunctionCheck(jaccard_louvain.FNN, inputType = "X", algorithmType = "K",
+                      outputType="vector")
+
+SNN <- ClusterFunction(jaccard_louvain.FNN, inputType = "X", algorithmType = "K",
+                     outputType="vector")
+
+set.seed(282582)
+cl_sub <- clusterSingle(
+  as(cl2, "SingleCellExperiment"), reduceMethod = "zinbwave", nDims = 10,
+  subsample = TRUE, sequential = FALSE,
+  mainClusterArgs = list(clusterFunction = "hierarchical01",
+                         clusterArgs = list(alpha = 0.2),
+                         minSize = 10),
+  subsampleArgs = list(resamp.num = 100,
+                       samp.p = 0.7,
+                       clusterFunction = SNN,
+                       clusterArgs = list(k = 30),
+                       ncores = 1)
+)
+cl_sub
+
+table(primaryClusterNamed(cl_sub), primaryClusterNamed(cl2))
+cl_sub <- addClusterings(cl_sub, primaryClusterNamed(cl2), clusterLabels = "Seurat") 
+cl_sub <- addClusterings(cl_sub, cl2$gfp, clusterLabels = "gfp") 
+clusterLabels(cl_sub)[1] <- "subsampling"
+clusterLegend(cl_sub)$Seurat <- clusterLegend(cl2)$Seurat
+clusterLegend(cl_sub)$gfp[,"color"] <- pal2
+
+plotClustersTable(cl_sub, whichClusters = c("subsampling", "Seurat"))
+
+png("co_clustering.png", width = 800, height = 800)
+plotCoClustering(cl_sub, whichClusters = c("subsampling", "Seurat", "gfp"))
+dev.off()
+```
+
+# Remove contaminants: S12, S13, S14
+
+```{r remove_samples, dependson="heatmap_zinb"}
+wh_rm <- which(primaryClusterNamed(cl2) %in% paste0("S", 12:14))
+
+tsne_sub <- Rtsne(W[-wh_rm,], pca = FALSE, max_iter=5000)
+umap_sub <- umap(W[-wh_rm,], n_neighbors = 15)
+
+plot(tsne_sub$Y, pch=19, col=colMerged1[-wh_rm], xlab="Dim 1", ylab="Dim 2")
+plot(tsne_sub$Y, pch=19, col=pal2[cl2$gfp[-wh_rm]], xlab="Dim 1", ylab="Dim 2")
+
+plot(umap_sub, pch=19, col=colMerged1[-wh_rm], xlab="Dim 1", ylab="Dim 2")
+plot(umap_sub, pch=19, col=pal2[cl2$gfp[-wh_rm]], xlab="Dim 1", ylab="Dim 2")
+```
+
+## Heatmap with markers
+
+```{r heat_clust}
+mgenes <- c("Calb1", "Pld5", "Chodl", "Hpse", "Crh", "Calb2", "Timp3")
+
+cl3 <- merged[,-wh_rm]
+cl3 <- makeDendrogram(cl3, reduceMethod = "zinbwave", nDims = 10,
+                      whichCluster = "Seurat")
+plotDendrogram(cl3, plotType = "name", leafType = "clusters")
+
+cl3 <- addClusterings(cl3, cl3$gfp, clusterLabels = "gfp")
+clusterLegend(cl3)$gfp[,"color"] <- pal2
+
+cl3 <- plotClusters(cl3, whichClusters = c("Seurat", "mergeClusters"),
+             existingColors = "firstOnly", resetColors = TRUE)
+
+plotHeatmap(cl3, clusterSamplesData = "dendrogramValue",
+            clusterFeaturesData=which(rownames(cl3) %in% mgenes),
+            breaks=.9,
+            whichClusters = c("Seurat", "mergeClusters", "gfp"))
+
+plotHeatmap(cl3, clusterSamplesData = "dendrogramValue",
+            clusterFeaturesData=which(rownames(cl3) %in% mgenes),
+            breaks=.9,
+            whichClusters = c("mergeClusters", "gfp"))
+
+df <- data.frame(t(assay(cl3)[mgenes,]), gfp = colData(cl3)$gfp,
+                 Cluster = factor(primaryClusterNamed(cl3), levels=paste0("m", c(1:4, 8:13))))
+
+cols1 <- clusterLegend(cl3)[[1]][, "color"]
+names(cols1) <- clusterLegend(cl3)[[1]][, "name"]
+colMerged3 <- cols1[primaryClusterNamed(cl3)]
+
+plot(assay(cl3)["Calb2",], assay(cl3)["Hpse",], pch=19, col=colMerged3, xlab="Calb2", ylab="Hpse")
+plot(assay(cl3)["Calb2",], assay(cl3)["Hpse",], pch=19, col=pal2[cl3$gfp], xlab="Calb2", ylab="Hpse")
+```
+
+# Allen clusters
+
+```{r allen_clusters, cache=FALSE}
+load("data/allen.rda")
+sce2 <- as(allen[, grep("^Sst", allen$cluster)], "SingleCellExperiment")
+rowData(sce2)$feature_symbol <- rownames(sce2)
+assayNames(sce2) <- "counts"
+genes <- intersect(rownames(sce2), rownames(cl2))
+sce2 <- scater::normalize(sce2[genes,])
+sce2 <- scater::runPCA(sce2, ncomponents = 30, method = "irlba",
+                       ntop = 1000)
+rm(allen)
+
+sce <- ClusterExperiment(sce2, colData(sce2)$cluster)
+
+sce <- makeDendrogram(sce, reduceMethod = "PCA", nDims = 30)
+plotDendrogram(sce, plotType = "name", leafType = "clusters")
+
+plotHeatmap(sce, clusterSamplesData = "dendrogramValue",
+            clusterFeaturesData=which(rownames(sce) %in% mgenes),
+            breaks=.8)
+
+pal_allen <- clusterLegend(sce)[[1]][,"color"]
+names(pal_allen) <- clusterLegend(sce)[[1]][,"name"]
+
+plot(counts(sce)["Calb2",], counts(sce)["Hpse",], pch=19, col=pal_allen[primaryClusterNamed(sce)], xlab="Calb2", ylab="Hpse")
+plotClusterLegend(sce)
+
+boxplot(logcounts(sce)["Hpse",]~primaryClusterNamed(sce), col=pal_allen[primaryClusterNamed(sce)], las=3)
+```
+
+## Mapping clusters with `scmap`
+
+```{r scmap, cache=FALSE, results="asis"}
+sce2 <- selectFeatures(sce2, suppress_plot = TRUE)
+sce2 <- indexCluster(sce2, cluster_col = "cluster")
+
+cl4 <- as(cl3, "SingleCellExperiment")
+rowData(cl4)$feature_symbol <- rownames(cl4)
+normcounts(cl4) <- assay(cl4)
+logcounts(cl4) <- log2(normcounts(cl4) + 1)
+
+scmapCluster_results <- scmapCluster(
+  projection = cl4, 
+  index_list = list(
+    Allen = metadata(sce2)$scmap_cluster_index
+  ), threshold = 0.4 #0.6
+)
+
+cols1 <- clusterLegend(cl3)[[1]][,"color"]
+names(cols1) <- clusterLegend(cl3)[[1]][,"name"]
+cols <- sapply(cols1, function(x) {
+  y <- col2rgb(x)[,1]
+  rgb(y[1]/255, y[2]/255, y[3]/255)
+})
+
+plot(
+  getSankey(
+    primaryClusterNamed(cl3), 
+    scmapCluster_results$scmap_cluster_labs[,'Allen'],
+    plot_height = 1000, colors = cols
+  ), tag="chart"
+)
+
+plot(
+  getSankey(
+    cl4$gfp, 
+    scmapCluster_results$scmap_cluster_labs[,'Allen'],
+    plot_height = 1000, colors = c("grey", "green")
+  ), tag="chart"
+)
+
+```
+
+```{r scmap_table, dependson = "scmap"}
+mat <- as.matrix(table(scmapCluster_results$scmap_cluster_labs, primaryClusterNamed(cl3)))
+print(data.frame(Our_cluster = colnames(mat),
+                 AIBS = rownames(mat)[apply(mat, 2, which.max)]))
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
