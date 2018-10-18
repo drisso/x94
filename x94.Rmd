@@ -794,7 +794,7 @@ plot(umap_sub, pch=19, col=pal2[cl2$gfp[-wh_rm]], xlab="Dim 1", ylab="Dim 2")
 ## Heatmap with markers
 
 ```{r heat_clust}
-mgenes <- c("Calb1", "Pld5", "Chodl", "Hpse", "Crh", "Calb2", "Timp3")
+mgenes <- c("Calb1", "Pld5", "Tacr1", "Hpse", "Crh", "Calb2")
 
 cl3 <- merged[,-wh_rm]
 cl3 <- makeDendrogram(cl3, reduceMethod = "zinbwave", nDims = 10,
@@ -816,6 +816,13 @@ plotHeatmap(cl3, clusterSamplesData = "dendrogramValue",
             clusterFeaturesData=which(rownames(cl3) %in% mgenes),
             breaks=.9,
             whichClusters = c("mergeClusters", "gfp"))
+
+pdf("Figure7a.pdf")
+plotHeatmap(cl3, clusterSamplesData = "dendrogramValue",
+            clusterFeaturesData=which(rownames(cl3) %in% mgenes),
+            breaks=.9,
+            whichClusters = c("mergeClusters", "gfp"))
+dev.off()
 
 df <- data.frame(t(assay(cl3)[mgenes,]), gfp = colData(cl3)$gfp,
                  Cluster = factor(primaryClusterNamed(cl3), levels=paste0("m", c(1:4, 8:13))))
@@ -861,7 +868,7 @@ boxplot(logcounts(sce)["Hpse",]~primaryClusterNamed(sce), col=pal_allen[primaryC
 
 ## Mapping clusters with `scmap`
 
-```{r scmap, cache=FALSE, results="asis"}
+```{r scmap, cache=FALSE, results="asis", eval=FALSE}
 sce2 <- selectFeatures(sce2, suppress_plot = TRUE)
 sce2 <- indexCluster(sce2, cluster_col = "cluster")
 
@@ -902,7 +909,7 @@ plot(
 
 ```
 
-```{r scmap_table, dependson = "scmap"}
+```{r scmap_table, dependson = "scmap", eval=FALSE}
 mat <- as.matrix(table(scmapCluster_results$scmap_cluster_labs, primaryClusterNamed(cl3)))
 print(data.frame(Our_cluster = colnames(mat),
                  AIBS = rownames(mat)[apply(mat, 2, which.max)]))
