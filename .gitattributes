@@ -1,0 +1,10 @@
+data/allen.rda filter=lfs diff=lfs merge=lfs -text
+data/clusterexperiment_all_batches.rda filter=lfs diff=lfs merge=lfs -text
+data/combined_filtered_all_batches.rda filter=lfs diff=lfs merge=lfs -text
+data/combined_filtered_qc.rda filter=lfs diff=lfs merge=lfs -text
+data/combined_scone_res_all_batches.rda filter=lfs diff=lfs merge=lfs -text
+data/combined_zinbwave_all_batches.rda filter=lfs diff=lfs merge=lfs -text
+data/gfptdt/filtered_gene_bc_matrices_h5.h5 filter=lfs diff=lfs merge=lfs -text
+data/tdt/filtered_gene_bc_matrices_h5.h5 filter=lfs diff=lfs merge=lfs -text
+data/tdt1/filtered_gene_bc_matrices_h5.h5 filter=lfs diff=lfs merge=lfs -text
+data/tdt2/filtered_gene_bc_matrices_h5.h5 filter=lfs diff=lfs merge=lfs -text
