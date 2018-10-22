@@ -347,10 +347,10 @@ save(zinb, file="data/combined_zinbwave_all_batches.rda")
 }
 
 W <- getW(zinb)
-rownames(W) <- colnames(filtered)
+rownames(W) <- paste0("Cell", seq_len(NROW(W)))
 colnames(W) <- paste0("W", 1:10)
-tsne_zinb <- Rtsne(W, pca = FALSE, max_iter=5000)
 
+tsne_zinb <- Rtsne(W, pca = FALSE, max_iter=5000)
 umap_zinb <- umap(W, n_neighbors = 15)
 ```
 
@@ -411,7 +411,7 @@ bars %>%
 
 ## Seurat
 
-```{r seurat, results="hide"}
+```{r seurat, results="hide", dependson="zinbwave"}
 dat <- assay(filtered)
 rownames(dat) <- rowData(filtered)$Symbol
 rownames(dat)[rownames(dat) == "Smim20"] <- paste0("Smim20", 1:2)
@@ -448,12 +448,10 @@ gfp[filtered$Batch == "TdT+GFP+"] <- "GFP"
 gfp <- as.factor(gfp)
 colData(cl2)$gfp <- gfp
 
-plotClusters(cl2, whichClusters = 2:1, existingColors = "firstOnly",
+plotClusters(cl2, whichClusters = 1, existingColors = "firstOnly",
              colData = c("Batch", "gfp"))
 
 plotClusters(cl2, existingColors = "firstOnly")
-
-plotClusters(cl2, whichClusters = c(1, 2), colData = c("gfp"), existingColors = "firstOnly")
 ```
 
 ## Visualization
@@ -483,10 +481,6 @@ plot(umap_zinb, pch=19, col=colMerged1, main="t-SNE, All genes, Seurat",
 
 plot(umap_zinb, pch=19, col=pal2[cl2$gfp])
 legend("bottomright", levels(cl2$gfp), fill=pal2)
-
-tab <- table(lab_s, gfp)
-print(tab)
-print(round(tab/rowSums(tab), 2))
 ```
 
 # Marker genes
@@ -502,81 +496,42 @@ merged <- mergeClusters(cl2, mergeMethod = "adjP", cutoff = 0.05, plotInfo="merg
 
 plotClustersTable(merged, whichClusters = 1:2)
 
-genes <- getBestFeatures(cl2, contrastType = "Dendro", DEMethod="limma-voom", number = 100)
+tab <- table(primaryClusterNamed(merged), gfp)
+print(tab)
+print(round(tab/rowSums(tab), 2))
+
+merged <- makeDendrogram(merged, reduceMethod = "zinbwave", nDims = 10)
+
+genes <- getBestFeatures(merged, contrastType = "Dendro", DEMethod="limma-voom", number = 100)
 head(genes)
 
-plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
-            sampleData = c("gfp", "Batch"),
+plotHeatmap(merged, clusterSamplesData = "dendrogramValue",
+            colData = c("gfp", "Batch"),
             clusterFeaturesData=unique(genes[,"IndexInOriginal"]), breaks=.99)
 
-genes_1vall <- getBestFeatures(cl2, contrastType = "OneAgainstAll",
-                               DEMethod="limma",
-                               number=100)
+top <- getBestFeatures(merged, contrastType="Dendro", DEMethod="limma", number=Inf, p.value=0.05)
 
-plotHeatmap(cl2, clusterSamplesData = "dendrogramValue", breaks=.95,
-            sampleData = c("gfp", "Batch"),
-            clusterFeaturesData=unique(genes_1vall[,"IndexInOriginal"]))
-
-genes_5 <- getBestFeatures(cl2, contrastType = "OneAgainstAll", DEMethod="limma",
-                               number=5)
-
-plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
-            sampleData = c("gfp", "Batch"),
-            clusterFeaturesData=unique(genes_5[,"IndexInOriginal"]), breaks=.99)
-
-genes_5 <- getBestFeatures(cl2, contrastType = "Dendro", DEMethod="limma",
-                               number=5)
-
-plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
-            sampleData = c("gfp", "Batch"),
-            clusterFeaturesData=unique(genes_5[,"IndexInOriginal"]), breaks=.99)
-
-top <- getBestFeatures(cl2, contrastType="Dendro", DEMethod="limma", number=Inf, p.value=0.05)
-
-xx <- factor(primaryClusterNamed(cl2), 
-             levels=paste0("S", 0:(nClusters(cl2)[1]-1)))
-means <- t(apply(log1p(assay(cl2))[top$Feature,], 1, tapply, xx, mean))
+xx <- factor(primaryClusterNamed(merged), 
+             levels=paste0("m", 1:(nClusters(merged)[1])))
+means <- t(apply(log1p(assay(merged))[top$Feature,], 1, tapply, xx, mean))
 
 retval <- cbind(top, means[top$Feature,])[, -c(3, 5, 7, 8, 11)]
 write.table(retval, "DE_genes_dendro_merged_zinb_all_batches.txt", quote=FALSE, sep="\t")
 
-top <- getBestFeatures(cl2, contrastType = "OneAgainstAll", DEMethod="limma", number=Inf, p.value=0.05)
+top <- getBestFeatures(merged, contrastType = "OneAgainstAll", DEMethod="limma", number=Inf, p.value=0.05)
 
-means <- t(apply(log1p(assay(cl2))[top$Feature,], 1, tapply, xx, mean))
+means <- t(apply(log1p(assay(merged))[top$Feature,], 1, tapply, xx, mean))
 retval <- cbind(top, means[top$Feature,])[, -c(3, 5, 7, 8, 11)]
 
-map <- data.frame(ids = paste0("Cl", stringr::str_pad(1:nClusters(cl2)[1], width=2, pad=0)),
-                  Contrast = clusterLegend(cl2)[[1]][,"name"], stringsAsFactors = FALSE)
+map <- data.frame(ids = paste0("Cl", stringr::str_pad(1:nClusters(merged)[1], width=2, pad=0)),
+                  Contrast = clusterLegend(merged)[[1]][,"name"], stringsAsFactors = FALSE)
 retval <- dplyr::inner_join(retval, map, by = c("ContrastName" = "ids"))[,-(1:2)]
 
 write.table(retval, "DE_genes_1vall_merged_zinb_all_batches.txt", quote=FALSE, sep="\t")
 ```
 
-```{r markers_zinb, dependson="heatmap_zinb"}
-markers <- list(m1=c("Ddit4l", "Whrn", "Plb1", "Aldh1l1", "Endou", "Thsd7a",
-                     "Spock3", "Car4"),
-                m3=c("Nnat", "Syt17", "Cdh13", "Cpne7", "Cnr1", "Plxna4"),
-                m7=c("Crym", "Tcerg1l", "Fam84b", "Serpine2", "Fam84a",
-                     "Bcl11b", "Bcl6", "Igfbp4", "Fezf2", "Npr3"),
-                m8=c("Hsd11b1", "Myl4", "Deptor", "Cplx2", "Tbr1", "Dkk3")
-)
-markers <- unlist(markers)
-
-plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
-            sampleData = c("gfp", "Batch"),
-            clusterFeaturesData=which(rownames(cl2) %in% markers), breaks=.99)
-
-plotContrastHeatmap(cl2, genes_5)
-
-genes_5b <- getBestFeatures(cl2, contrastType = "OneAgainstAll",
-                            DEMethod="limma-voom", number=5)
-
-plotContrastHeatmap(cl2, genes_5b)
-```
-
 ```{r save, dependson="clX"}
-table(lab_s, cl2$Batch)
-save(cl2, file="data/clusterexperiment_all_batches.rda")
+save(merged, file="data/clusterexperiment_all_batches.rda")
 ```
 
 ```{r allen, dependson="heatmap_zinb"}
@@ -585,14 +540,14 @@ fig2 <- c("Sst", "Chodl", "Nos1", "Etv1", "Il1rapl2", "Myh8", "Chrna2",
           "Gabrg1", "Th", "Prdm8", "Calb1", "Reln", "Gpr149", "Cpne5",
           "Vipr2", "Nkx2.1")
 
-plotHeatmap(cl2, clusterSamplesData = "dendrogramValue",
+plotHeatmap(merged, clusterSamplesData = "dendrogramValue",
             sampleData = c("gfp"),
             clusterFeaturesData=which(rownames(cl2) %in% fig2), breaks=.99)
 
-rownames(lognorm) <- rownames(cl2)
+rownames(lognorm) <- rownames(merged)
 
 df <- data.frame(t(lognorm[intersect(c(fig2, "GFP", "tdTomato"), rownames(lognorm)),]),
-                 Cluster = lab_s, Batch = cl2$Batch)
+                 Cluster = primaryClusterNamed(merged), Batch = cl2$Batch)
 
 ggplot(df, aes(x = Calb1, y = Batch, fill = Batch)) +
   geom_density_ridges() + 
@@ -868,7 +823,7 @@ boxplot(logcounts(sce)["Hpse",]~primaryClusterNamed(sce), col=pal_allen[primaryC
 
 ## Mapping clusters with `scmap`
 
-```{r scmap, cache=FALSE, results="asis", eval=FALSE}
+```{r scmap, cache=FALSE, results="asis"}
 sce2 <- selectFeatures(sce2, suppress_plot = TRUE)
 sce2 <- indexCluster(sce2, cluster_col = "cluster")
 
@@ -890,29 +845,113 @@ cols <- sapply(cols1, function(x) {
   y <- col2rgb(x)[,1]
   rgb(y[1]/255, y[2]/255, y[3]/255)
 })
-
-plot(
-  getSankey(
-    primaryClusterNamed(cl3), 
-    scmapCluster_results$scmap_cluster_labs[,'Allen'],
-    plot_height = 1000, colors = cols
-  ), tag="chart"
-)
-
-plot(
-  getSankey(
-    cl4$gfp, 
-    scmapCluster_results$scmap_cluster_labs[,'Allen'],
-    plot_height = 1000, colors = c("grey", "green")
-  ), tag="chart"
-)
+# 
+# plot(
+#   getSankey(
+#     primaryClusterNamed(cl3), 
+#     scmapCluster_results$scmap_cluster_labs[,'Allen'],
+#     plot_height = 1000, colors = cols
+#   ), tag="chart"
+# )
+# 
+# plot(
+#   getSankey(
+#     cl4$gfp, 
+#     scmapCluster_results$scmap_cluster_labs[,'Allen'],
+#     plot_height = 1000, colors = c("grey", "green")
+#   ), tag="chart"
+# )
 
 ```
 
-```{r scmap_table, dependson = "scmap", eval=FALSE}
+```{r scmap_table, dependson = "scmap"}
 mat <- as.matrix(table(scmapCluster_results$scmap_cluster_labs, primaryClusterNamed(cl3)))
 print(data.frame(Our_cluster = colnames(mat),
                  AIBS = rownames(mat)[apply(mat, 2, which.max)]))
+```
+
+```{r static, eval = FALSE}
+library(ggforce)
+library(dplyr)
+alpha <- 0.7
+
+dat_raw <- data.frame("Ref_Allen" = scmapCluster_results$scmap_cluster_labs[,1],
+                      "Clusters" = primaryClusterNamed(cl3),
+                      stringsAsFactors = FALSE)
+
+dat <- dat_raw %>%
+  dplyr::filter(! Clusters %in% c("S12", "S13", "S14")) %>%
+  group_by(Clusters, Ref_Allen) %>%
+  summarise(freq = n()) %>%
+  ungroup()
+
+dat_ggforce <- dat  %>%
+  gather_set_data(2:1) %>%        # <- ggforce helper function
+  dplyr::arrange(x, Ref_Allen, desc(Clusters))
+
+dat_filtered <- dat_ggforce %>%
+  dplyr::filter(freq >= 10)
+
+ggplot(dat_filtered, aes(x = x, id = id, split = y, value = freq)) +
+  geom_parallel_sets(aes(fill = Clusters), alpha = alpha, axis.width = 0.2,
+                     n=100, strength = 0.5) +
+  geom_parallel_sets_axes(axis.width = 0.25, fill = "gray95",
+                          color = "gray80", size = 0.15) +
+  geom_parallel_sets_labels(colour = 'gray35', size = 4.5, angle = 0, fontface="bold") +
+  scale_fill_manual(values  = cols) +
+  scale_color_manual(values = cols) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_blank(),
+    axis.text.x = element_text(size = 20, face = "bold"),
+    axis.title.x  = element_blank()
+    ) -> p1
+p1
+
+ggsave("riverplot.pdf", p1, width = 10, height = 10)
+
+dat_raw <- data.frame("Ref_Allen" = scmapCluster_results$scmap_cluster_labs[,1],
+                      "Clusters" = primaryClusterNamed(cl3),
+                      "GFP" = cl3$gfp,
+                      stringsAsFactors = FALSE)
+
+dat <- dat_raw %>%
+  dplyr::filter(! Clusters %in% c("S12", "S13", "S14")) %>%
+  group_by(GFP, Ref_Allen) %>%
+  summarise(freq = n()) %>%
+  ungroup()
+
+dat_ggforce <- dat  %>%
+  gather_set_data(2:1) %>%        # <- ggforce helper function
+  dplyr::arrange(x, Ref_Allen, desc(GFP))
+
+dat_filtered <- dat_ggforce %>%
+  dplyr::filter(freq >= 10)
+
+cols2 <- c("green", "grey")
+
+ggplot(dat_filtered, aes(x = x, id = id, split = y, value = freq)) +
+  geom_parallel_sets(aes(fill = GFP), alpha = alpha, axis.width = 0.2,
+                     n=100, strength = 0.5) +
+  geom_parallel_sets_axes(axis.width = 0.25, fill = "gray95",
+                          color = "gray80", size = 0.15) +
+  geom_parallel_sets_labels(colour = 'gray35', size = 4.5, angle = 0, fontface="bold") +
+  scale_fill_manual(values  = cols2) +
+  scale_color_manual(values = cols2) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_blank(),
+    axis.text.x = element_text(size = 20, face = "bold"),
+    axis.title.x  = element_blank()
+    ) -> p2
+p2
+ggsave("riverplot_gfp.pdf", p2, width = 10, height = 10)
 ```
 
 # Session Info
