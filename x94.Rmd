@@ -55,6 +55,8 @@ tdt2 <- matrixSummarizedExperiment("data/tdt2/filtered_gene_bc_matrices_h5.h5")
 
 se <- cbind(tdt1, tdt2, tdt, gfptdt)
 se
+colnames(se) <- paste0("Cell", seq_len(NCOL(se)))
+
 colData(se)$Batch <- as.factor(c(rep("TdT+1", NCOL(tdt1)),
                                  rep("TdT+2", NCOL(tdt2)),
                                  rep("TdT+3", NCOL(tdt)),
@@ -546,6 +548,9 @@ plotHeatmap(merged, clusterSamplesData = "dendrogramValue",
 
 rownames(lognorm) <- rownames(merged)
 
+cols1 <- clusterLegend(merged)[[1]][, "color"]
+names(cols1) <- clusterLegend(merged)[[1]][, "name"]
+
 df <- data.frame(t(lognorm[intersect(c(fig2, "GFP", "tdTomato"), rownames(lognorm)),]),
                  Cluster = primaryClusterNamed(merged), Batch = cl2$Batch)
 
@@ -748,7 +753,7 @@ plot(umap_sub, pch=19, col=pal2[cl2$gfp[-wh_rm]], xlab="Dim 1", ylab="Dim 2")
 
 ## Heatmap with markers
 
-```{r heat_clust}
+```{r heat_clust, dependson="heatmap_zinb"}
 mgenes <- c("Calb1", "Pld5", "Tacr1", "Hpse", "Crh", "Calb2")
 
 cl3 <- merged[,-wh_rm]
