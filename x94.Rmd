@@ -518,7 +518,7 @@ xx <- factor(primaryClusterNamed(merged),
 means <- t(apply(log1p(assay(merged))[top$Feature,], 1, tapply, xx, mean))
 
 retval <- cbind(top, means[top$Feature,])[, -c(3, 5, 7, 8, 11)]
-write.table(retval, "DE_genes_dendro_merged_zinb_all_batches.txt", quote=FALSE, sep="\t")
+write.table(retval, "DE_genes_dendro_merged_zinb_all_batches.txt", quote=FALSE, sep="\t", row.names = FALSE)
 
 top <- getBestFeatures(merged, contrastType = "OneAgainstAll", DEMethod="limma", number=Inf, p.value=0.05)
 
@@ -529,7 +529,7 @@ map <- data.frame(ids = paste0("Cl", stringr::str_pad(1:nClusters(merged)[1], wi
                   Contrast = clusterLegend(merged)[[1]][,"name"], stringsAsFactors = FALSE)
 retval <- dplyr::inner_join(retval, map, by = c("ContrastName" = "ids"))[,-(1:2)]
 
-write.table(retval, "DE_genes_1vall_merged_zinb_all_batches.txt", quote=FALSE, sep="\t")
+write.table(retval, "DE_genes_1vall_merged_zinb_all_batches.txt", quote=FALSE, sep="\t", row.names = FALSE)
 ```
 
 ```{r save, dependson="clX"}
